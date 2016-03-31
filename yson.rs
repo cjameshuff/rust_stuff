@@ -3,7 +3,15 @@ use std::num;
 
 #[derive(Debug)]
 pub enum YSONError {
+    ParseError,
+    ParseNoTerminatingQuote(String),
+    ParseBadEscapeCode(String),
+    ParseExpect(String),
+    ParseUnexpectedEndOfInput,
     ParseFloatError(num::ParseFloatError),
+    ValueNotMapError,
+    ValueNotArrayError,
+    ValueNotScalarError,
     ScalarNotFloatError
 }
 
@@ -23,14 +31,15 @@ impl<'a> YSONParser<'a> {
         self.src = self.src.trim_left();
     }
     
-    fn require(&mut self, tok: &str) {
+    fn require(&mut self, tok: &str) -> Result<(), YSONError> {
         self.eat_white();
         if self.src.starts_with(tok) {
             self.src = self.src.split_at(tok.len()).1;
             self.eat_white();
+            Ok(())
         }
         else {
-            panic!("Expected token {} not found.", tok)
+            Err(YSONError::ParseExpect(tok.to_string()))
         }
     }
     
@@ -42,70 +51,82 @@ impl<'a> YSONParser<'a> {
         }
     }
     
-    pub fn parse_map(&mut self) -> YSONValue<'a> {
+    pub fn parse_map(&mut self) -> Result<YSONValue<'a>, YSONError> {
         let mut values = Vec::new();
-        self.require("{");
+        try!(self.require("{"));
         while !self.src.starts_with('}') {
-            let key = self.parse_scalar();
-            self.require(":");
-            let value = self.parse_value();
+            let key = try!(self.parse_scalar());
+            try!(self.require(":"));
+            let value = try!(self.parse_value());
             self.allow(",");
             values.push((key, value));
         }
-        self.require("}");
+        try!(self.require("}"));
         println!("parsed map");
-        YSONValue::Map{values: values}
+        Ok(YSONValue::Map{values: values})
     }
     
-    pub fn parse_array(&mut self) -> YSONValue<'a> {
+    pub fn parse_array(&mut self) -> Result<YSONValue<'a>, YSONError> {
         let mut values = Vec::new();
-        self.require("[");
+        try!(self.require("["));
         while !self.src.starts_with(']') {
-            values.push(self.parse_value());
+            values.push(try!(self.parse_value()));
             self.allow(",");
         }
-        self.require("]");
+        try!(self.require("]"));
         println!("parsed array");
-        YSONValue::Array{values: values}
+        Ok(YSONValue::Array{values: values})
     }
     
-    pub fn parse_quoted_string(&mut self) -> YSONValue<'a> {
+    pub fn parse_quoted_string(&mut self) -> Result<YSONValue<'a>, YSONError> {
         // Parse series of characters starting and ending with '"', including whitespace and
         // newlines.
         let mut chars = self.src.char_indices();
-        let mut prev_char = '\\';
+        chars.next();// skip opening '"'
+        let mut string_value = String::new();
         loop {
             let (idx, this_char) = match chars.next() {
-                None => panic!("Expected terminating \" not found."),
+                None => return Err(YSONError::ParseNoTerminatingQuote(string_value)),
                 Some((idx, ch)) => ((idx, ch))
             };
-            if this_char == '"' && prev_char != '\\' {
-                let (s, src2) = self.src.split_at(idx + 1);
-                self.src = src2;
-                println!("parsed quoted string: {}", s);
-                return YSONValue::RawScalar{value: s};
+            
+            if this_char == '\\' {
+                string_value.push(match chars.next() {
+                    Some((_, 'r')) => '\r',
+                    Some((_, 'n')) => '\n',
+                    Some((_, 't')) => '\t',
+                    Some((_, '"')) => '"',
+                    Some((_, '\'')) => '\'',
+                    Some((_, '\\')) => '\\',
+                    _ => return Err(YSONError::ParseBadEscapeCode(this_char.to_string()))
+                })
+            }
+            else if this_char == '"' {
+                self.src = self.src.split_at(idx + 1).1;
+                println!("parsed quoted string: {}", string_value);
+                return Ok(YSONValue::String{value: string_value});
             }
             else {
-                prev_char = this_char;
+                string_value.push(this_char);
             }
         }
     }
     
-    pub fn parse_literal(&mut self) -> YSONValue<'a> {
+    pub fn parse_literal(&mut self) -> Result<YSONValue<'a>, YSONError> {
         // Parse series of characters consisting of any character but: ":,]}", or
         // whitespace.
         match self.src.find(|ch| char::is_whitespace(ch) || ":,]}".contains(ch)) {
-            None => panic!("End of input reached while parsing literal."),
+            None => return Err(YSONError::ParseUnexpectedEndOfInput),
             Some(idx) => {
                 let (s, src2) = self.src.split_at(idx);
                 self.src = src2;
                 println!("parsed literal: {}", s);
-                return YSONValue::RawScalar{value: s};
+                return Ok(YSONValue::RawScalar{value: s});
             }
         }
     }
     
-    pub fn parse_scalar(&mut self) -> YSONValue<'a> {
+    pub fn parse_scalar(&mut self) -> Result<YSONValue<'a>, YSONError> {
         if self.src.starts_with('"') {
             return self.parse_quoted_string();
         }
@@ -114,7 +135,7 @@ impl<'a> YSONParser<'a> {
         };
     }
     
-    pub fn parse_value(&mut self) -> YSONValue<'a> {
+    pub fn parse_value(&mut self) -> Result<YSONValue<'a>, YSONError> {
         self.eat_white();
         if self.src.starts_with('{') {
             return self.parse_map();
@@ -130,48 +151,47 @@ impl<'a> YSONParser<'a> {
 
 
 impl<'a> YSONValue<'a> {
-    pub fn parse(src: &'a str) -> YSONValue<'a> {
+    pub fn parse(src: &'a str) -> Result<YSONValue<'a>, YSONError> {
         let mut parser = YSONParser{src: src};
         parser.parse_value()
     }
     
-    pub fn map_values(&self) -> Option<&Vec<(YSONValue<'a>, YSONValue<'a>)>> {
+    pub fn map_values(&self) -> Result<&Vec<(YSONValue<'a>, YSONValue<'a>)>, YSONError> {
         match *self {
-            YSONValue::Map{ref values} => Some(values),
-            _ => None
+            YSONValue::Map{ref values} => Ok(values),
+            _ => Err(YSONError::ValueNotMapError)
         }
     }
     
-    pub fn map_value(&self, key: &str) -> Option<&YSONValue<'a>> {
+    pub fn map_value(&self, key: &str) -> Result<&YSONValue<'a>, YSONError> {
         for x in self.map_values().unwrap() {
             if x.0.scalar_value().unwrap() == key {
-                return Some(&(x.1));
+                return Ok(&(x.1));
             }
         }
-        return None;
+        return Err(YSONError::ValueNotMapError);
     }
     
-    pub fn array_values(&self) -> Option<&Vec<YSONValue<'a>>> {
+    pub fn array_values(&self) -> Result<&Vec<YSONValue<'a>>, YSONError> {
         match *self {
-            YSONValue::Array{ref values} => Some(values),
-            _ => None
+            YSONValue::Array{ref values} => Ok(values),
+            _ => Err(YSONError::ValueNotArrayError)
         }
     }
     
-    pub fn scalar_value(&self) -> Option<&str> {
+    pub fn scalar_value(&self) -> Result<&str, YSONError> {
         match *self {
-            YSONValue::RawScalar{ref value} => Some(value),
-            YSONValue::String{ref value} => Some(&value),
-            _ => None
+            YSONValue::RawScalar{ref value} => Ok(value),
+            YSONValue::String{ref value} => Ok(&value),
+            _ => Err(YSONError::ValueNotScalarError)
         }
     }
     
     pub fn f64_value(&self) -> Result<f64, YSONError> {
-        let scal_val = match self.scalar_value() {
-            Some(scalar) => scalar,
-            _ => return Err(YSONError::ScalarNotFloatError)
+        match self.scalar_value() {
+            Ok(scalar) => return scalar.parse::<f64>().map_err(YSONError::ParseFloatError),
+            Err(e) => return Err(e)
         };
-        scal_val.parse::<f64>().map_err(YSONError::ParseFloatError)
     }
     
     pub fn display(&self) {
